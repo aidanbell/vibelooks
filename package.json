@@ -1,0 +1,10 @@
+{
+  "name": "vibelooks",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.18" },
+  "scripts": {
+    "crawl": "node --env-file-if-exists=.env --no-warnings=ExperimentalWarning scripts/crawl.ts",
+    "report": "node --env-file-if-exists=.env --no-warnings=ExperimentalWarning scripts/report.ts"
+  }
+}
