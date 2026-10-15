@@ -8,15 +8,24 @@ export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export async function gh(url: string, init: RequestInit = {}): Promise<any> {
   for (let attempt = 0; attempt < 5; attempt++) {
-    const res = await fetch(url, {
-      ...init,
-      headers: {
-        Authorization: `Bearer ${TOKEN}`,
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        ...init.headers,
-      },
-    });
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        ...init,
+        headers: {
+          Authorization: `Bearer ${TOKEN}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          ...init.headers,
+        },
+      });
+    } catch (err) {
+      // Dropped connections ("other side closed") are routine on long crawls.
+      if (attempt === 4) throw err;
+      console.warn(`  network error (${(err as any).cause?.code ?? (err as Error).message}), retrying`);
+      await sleep(2000 * (attempt + 1));
+      continue;
+    }
     if (res.ok) return res.json();
     if (res.status === 403 || res.status === 429) {
       const retryAfter = Number(res.headers.get("retry-after"));

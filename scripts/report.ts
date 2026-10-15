@@ -1,18 +1,21 @@
 // Summarise data/vibelooks.db: each metric overall and per agent.
-// Also writes data/summary.json for the site.
+// Also writes data/summary.json, and web/public/summary.json when run inside the repo.
 //
 // Usage: npm run report
 
-import { writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import { db } from "./lib/db.ts";
 
-type Row = { name: string; agents: string[]; pkg: any; style: any };
+type Row = { name: string; agents: string[]; days: Record<string, string>; pkg: any; style: any };
 
 const agentsOf = new Map<string, string[]>();
-for (const r of db.prepare("SELECT name, agent FROM repo_agents").all()) {
+const daysOf = new Map<string, Record<string, string>>(); // repo -> agent -> day found
+for (const r of db.prepare("SELECT name, agent, day FROM repo_agents").all()) {
   const list = agentsOf.get(String(r.name)) ?? [];
   list.push(String(r.agent));
   agentsOf.set(String(r.name), list);
+  daysOf.set(String(r.name), { ...daysOf.get(String(r.name)), [String(r.agent)]: String(r.day) });
 }
 const rows: Row[] = db
   .prepare(`SELECT p.name, p.data AS pkg, s.data AS style FROM packages p LEFT JOIN styles s USING (name) WHERE p.frontend = 1`)
@@ -20,6 +23,7 @@ const rows: Row[] = db
   .map((r) => ({
     name: String(r.name),
     agents: agentsOf.get(String(r.name)) ?? [],
+    days: daysOf.get(String(r.name)) ?? {},
     pkg: JSON.parse(String(r.pkg)),
     style: r.style ? JSON.parse(String(r.style)) : null,
   }));
@@ -60,7 +64,7 @@ const METRICS: Metric[] = [
   { title: "Top emoji", of: "style", labels: (r) => r.style.emoji.top, limit: 10 },
 ];
 
-function tally(metric: Metric) {
+function tally(metric: Metric, keep = metric.limit ?? 12) {
   const pool = rows.filter((r) => metric.of === "pkg" || r.style);
   const groups = { all: pool, ...Object.fromEntries(AGENTS.map((a) => [a, pool.filter((r) => r.agents.includes(a))])) };
   const counts: Record<string, Record<string, number>> = {};
@@ -70,12 +74,55 @@ function tally(metric: Metric) {
   const sizes = Object.fromEntries(Object.entries(groups).map(([g, l]) => [g, l.length]));
   const labels = Object.entries(counts)
     .sort((a, b) => (b[1].all ?? 0) - (a[1].all ?? 0))
-    .slice(0, metric.limit ?? 12)
+    .slice(0, keep)
     .map(([label, c]) => ({ label, pct: Object.fromEntries(Object.keys(groups).map((g) => [g, sizes[g] ? (c[g] ?? 0) / sizes[g] : 0])) }));
   return { title: metric.title, sizes, labels };
 }
 
-const results = METRICS.map(tally);
+const results = METRICS.map((m) => tally(m));
+
+// ---- Trends: share of each group's repos per week (all agents, then each agent) ----
+// A repo counts in the week of the day it was discovered for that agent. Files are read at
+// the discovery commit, so this is what the repo looked like then. Weeks start on Monday (UTC).
+const weekOf = (day: string) => {
+  const t = Date.parse(day);
+  return new Date(t - ((new Date(t).getUTCDay() + 6) % 7) * 86_400_000).toISOString().slice(0, 10);
+};
+const WEEKS = [...new Set(rows.flatMap((r) => Object.values(r.days).map(weekOf)))].sort();
+const TREND_LABELS = 25;
+
+const GROUPS = ["all", ...AGENTS];
+// "all" counts each repo once, in the week it was first found by any agent.
+const weekIn = (r: Row, g: string) => weekOf(g === "all" ? Object.values(r.days).sort()[0] : r.days[g]);
+
+const trends = {
+  weeks: WEEKS,
+  metrics: METRICS.map((metric) => {
+    const pool = rows.filter((r) => metric.of === "pkg" || r.style);
+    // n[group][week], and per label, count[group][week]
+    const n: Record<string, number[]> = {};
+    const counts: Record<string, Record<string, number[]>> = {};
+    for (const g of GROUPS) n[g] = WEEKS.map(() => 0);
+    for (const r of pool)
+      for (const g of GROUPS) {
+        if (g !== "all" && !r.agents.includes(g)) continue;
+        const w = WEEKS.indexOf(weekIn(r, g));
+        n[g][w]++;
+        for (const l of new Set(metric.labels(r))) if (l) ((counts[l] ??= {})[g] ??= WEEKS.map(() => 0))[w]++;
+      }
+    const wanted = tally(metric, TREND_LABELS).labels.map((l) => l.label);
+    return {
+      title: metric.title,
+      n,
+      labels: wanted.map((label) => ({
+        label,
+        pct: Object.fromEntries(
+          GROUPS.map((g) => [g, WEEKS.map((_, w) => (n[g][w] ? Math.round(((counts[label]?.[g]?.[w] ?? 0) / n[g][w]) * 1e4) / 1e4 : null))]),
+        ),
+      })),
+    };
+  }),
+};
 
 // ---- Print ----
 const cols = ["all", ...AGENTS];
@@ -89,8 +136,18 @@ for (const m of results) {
   for (const l of m.labels) console.log(`  ${l.label.slice(0, 30).padEnd(30)}${cols.map((c) => fmt(l.pct[c])).join("")}`);
 }
 
-await writeFile(
-  "data/summary.json",
-  JSON.stringify({ generatedAt: new Date().toISOString(), discovered, frontend: rows.length, scanned, metrics: results }, null, 2),
+const range = db.prepare("SELECT MIN(day) AS start, MAX(day) AS end FROM repo_agents").get();
+const summary = JSON.stringify(
+  { generatedAt: new Date().toISOString(), range, discovered, frontend: rows.length, scanned, metrics: results, trends },
+  null,
+  2,
 );
-console.log("\n-> data/summary.json");
+await mkdir("data", { recursive: true });
+await writeFile("data/summary.json", summary);
+// The site copy only exists where the repo's web/ folder does (not on the crawl server).
+const site = existsSync("web");
+if (site) {
+  await mkdir("web/public", { recursive: true });
+  await writeFile("web/public/summary.json", summary);
+}
+console.log(`\n-> data/summary.json${site ? ", web/public/summary.json" : ""}`);
