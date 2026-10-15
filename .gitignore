@@ -1,3 +1,16 @@
+# Secrets
 .env
+
+# Crawl output (SQLite db, backups, raw samples, logs). Regenerate with `npm run crawl`.
 data/
+
+# Dependencies and build output
 node_modules/
+dist/
+
+# Misc
+*.log
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea/
